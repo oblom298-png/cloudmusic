@@ -1,118 +1,147 @@
 /**
- * ClaudMusic — WebSocket + HTTP Server
+ * ClaudMusic — Production Server
+ * Railway / Render / VPS compatible
  *
- * ЗАПУСК (любой из вариантов):
- *   node server.js           ← автоматически соберёт фронтенд если нужно
- *   npm run build && node server.js
+ * ЗАПУСК:
+ *   node server.js           ← соберёт фронтенд если dist/ отсутствует
+ *   npm start                ← то же самое
  *
- * Railway / Render:
- *   Build command:  npm run build
- *   Start command:  node server.js
- *   PORT берётся из env автоматически
+ * ДЕПЛОЙ:
+ *   Railway:  Build = "npm run build"  |  Start = "node server.js"  |  Port = 3000
+ *   Render:   Build = "npm run build"  |  Start = "node server.js"
  */
 
-import { createServer }          from 'http';
-import { WebSocketServer }       from 'ws';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname }         from 'path';
-import { fileURLToPath }         from 'url';
-import { execSync }              from 'child_process';
+import { createServer }    from 'http';
+import { WebSocketServer } from 'ws';
+import {
+  readFileSync, writeFileSync,
+  existsSync,   mkdirSync,
+} from 'fs';
+import { join, dirname }   from 'path';
+import { fileURLToPath }   from 'url';
+import { execSync }        from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
-const PORT       = Number(process.env.PORT) || 3000;
-const HOST       = process.env.HOST || '0.0.0.0';
 
-// ─── AUTO-BUILD if dist/index.html missing ────────────────────────────────────
+// ─── PORT ────────────────────────────────────────────────────────────────────
+// Railway injects $PORT automatically. Default 3000 for local.
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = '0.0.0.0'; // IMPORTANT: must be 0.0.0.0 for Railway/Render
+
+// ─── AUTO-BUILD ───────────────────────────────────────────────────────────────
 const DIST_HTML = join(__dirname, 'dist', 'index.html');
-
 if (!existsSync(DIST_HTML)) {
-  console.log('⚙️  dist/index.html не найден — запускаю npm run build...\n');
+  console.log('⚙️  dist/index.html not found — building...\n');
   try {
     execSync('npm run build', { stdio: 'inherit', cwd: __dirname });
-    console.log('\n✅ Сборка завершена!\n');
-  } catch (e) {
-    console.error('\n❌ Ошибка сборки. Убедись что установлены зависимости:');
-    console.error('   npm install\n   npm run build\n');
+    console.log('\n✅ Build done!\n');
+  } catch {
+    console.error('❌ Build failed. Run: npm install && npm run build');
     process.exit(1);
   }
 }
 
-// ─── PATHS ───────────────────────────────────────────────────────────────────
-const DATA_DIR  = join(__dirname, 'data');
-const DB_FILE   = join(DATA_DIR, 'db.json');
+// ─── DATA PERSISTENCE ────────────────────────────────────────────────────────
+const DATA_DIR = join(__dirname, 'data');
+const DB_FILE  = join(DATA_DIR, 'db.json');
 
-// ─── DB ──────────────────────────────────────────────────────────────────────
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
 function loadDb() {
   try {
     if (existsSync(DB_FILE)) {
-      const parsed = JSON.parse(readFileSync(DB_FILE, 'utf-8'));
+      const raw    = readFileSync(DB_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
       return {
         tracks: Array.isArray(parsed.tracks) ? parsed.tracks : [],
         users:  Array.isArray(parsed.users)  ? parsed.users  : [],
       };
     }
-  } catch (e) { console.error('[DB] load error:', e.message); }
+  } catch (e) {
+    console.error('[DB] Load error:', e.message);
+  }
   return { tracks: [], users: [] };
 }
 
 function saveDb() {
-  try { writeFileSync(DB_FILE, JSON.stringify(state, null, 2), 'utf-8'); }
-  catch (e) { console.error('[DB] save error:', e.message); }
+  try {
+    writeFileSync(DB_FILE, JSON.stringify(state, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[DB] Save error:', e.message);
+  }
 }
 
 const state = loadDb();
-console.log(`[DB] Загружено: ${state.tracks.length} треков, ${state.users.length} пользователей`);
+console.log(`[DB] Loaded: ${state.tracks.length} tracks, ${state.users.length} users`);
 
-// ─── HTTP SERVER ─────────────────────────────────────────────────────────────
+// ─── HTML CACHE ───────────────────────────────────────────────────────────────
+let htmlCache = null;
+function getHtml() {
+  if (!htmlCache) {
+    try { htmlCache = readFileSync(DIST_HTML); } catch { return null; }
+  }
+  return htmlCache;
+}
+
+// ─── HTTP SERVER ──────────────────────────────────────────────────────────────
 const httpServer = createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // ── API ───────────────────────────────────────────────────────────────────
+  // ── API: health check ─────────────────────────────────────────────────────
   if (req.url === '/api/health' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true, tracks: state.tracks.length, users: state.users.length, uptime: Math.round(process.uptime()) }));
+    res.end(JSON.stringify({
+      ok: true,
+      tracks: state.tracks.length,
+      users:  state.users.length,
+      uptime: Math.round(process.uptime()),
+      port:   PORT,
+    }));
     return;
   }
 
+  // ── API: server state (tracks + users metadata) ───────────────────────────
   if (req.url === '/api/state' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ tracks: state.tracks, users: state.users }));
     return;
   }
 
-  // ── Serve dist/index.html for ALL requests ────────────────────────────────
-  // vite-plugin-singlefile inlines ALL JS/CSS into one index.html
+  // ── SPA fallback: ALL requests → dist/index.html ─────────────────────────
+  // vite-plugin-singlefile inlines ALL assets into one index.html file.
+  // So every URL just returns that single file.
   if (req.method !== 'GET') {
-    res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
     res.end('Method Not Allowed');
     return;
   }
 
-  try {
-    const html = readFileSync(DIST_HTML);
-    res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'X-Content-Type-Options': 'nosniff',
-    });
-    res.end(html);
-  } catch {
+  const html = getHtml();
+  if (!html) {
     res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Сервер запускается, подожди секунду и обнови страницу...');
+    res.end('App is starting up, please refresh in a moment...');
+    return;
   }
+
+  res.writeHead(200, {
+    'Content-Type':           'text/html; charset=utf-8',
+    'Cache-Control':          'no-cache, no-store, must-revalidate',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(html);
 });
 
-// ─── WS HELPERS ──────────────────────────────────────────────────────────────
+// ─── WS HELPERS ───────────────────────────────────────────────────────────────
+const wss          = new WebSocketServer({ server: httpServer });
+const clientUserMap = new Map(); // ws → userId
+
 function send(ws, data) {
-  try { if (ws.readyState === 1) ws.send(JSON.stringify(data)); }
-  catch (e) { console.error('[WS] send error:', e.message); }
+  try { if (ws.readyState === 1) ws.send(JSON.stringify(data)); } catch { /**/ }
 }
 
 function broadcast(data, except = null) {
@@ -133,16 +162,16 @@ function notifyUser(targetUserId, notification) {
 }
 
 function makeNotif(type, text, icon = '🔔', trackId = null) {
-  return { id: 'n_' + Date.now() + '_' + Math.random().toString(36).slice(2), type, text, icon, ts: Date.now(), trackId };
+  return {
+    id:      'n_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+    type, text, icon, ts: Date.now(), trackId,
+  };
 }
 
-// ─── WEBSOCKET ───────────────────────────────────────────────────────────────
-const wss = new WebSocketServer({ server: httpServer });
-const clientUserMap = new Map(); // ws → userId
-
+// ─── WEBSOCKET HANDLERS ───────────────────────────────────────────────────────
 wss.on('connection', (ws, req) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`[WS] +подключение ${ip} (всего: ${wss.clients.size})`);
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?';
+  console.log(`[WS] +connect  ${ip}  (total: ${wss.clients.size})`);
   clientUserMap.set(ws, null);
 
   ws.on('message', (raw) => {
@@ -151,40 +180,47 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
 
+      // ── Client connected, wants current state ─────────────────────────────
       case 'INIT': {
         if (msg.userId) clientUserMap.set(ws, msg.userId);
         send(ws, { type: 'STATE', tracks: state.tracks, users: state.users });
         break;
       }
 
+      // ── User logged in on client ──────────────────────────────────────────
       case 'IDENTIFY': {
         if (msg.userId) clientUserMap.set(ws, msg.userId);
         break;
       }
 
+      // ── Register new user ─────────────────────────────────────────────────
       case 'REGISTER': {
         const { user } = msg;
-        if (!user?.name || !user?.email) { send(ws, { type: 'ERROR', message: 'Имя и email обязательны' }); break; }
-
+        if (!user?.name || !user?.email) {
+          send(ws, { type: 'ERROR', message: 'Имя и email обязательны' });
+          break;
+        }
         const nameLow  = user.name.trim().toLowerCase();
         const emailLow = user.email.trim().toLowerCase();
 
         if (state.users.some(u => u.name.trim().toLowerCase() === nameLow)) {
-          send(ws, { type: 'ERROR', message: `Имя «${user.name.trim()}» уже занято` }); break;
+          send(ws, { type: 'ERROR', message: `Имя «${user.name.trim()}» уже занято` });
+          break;
         }
         if (state.users.some(u => u.email.trim().toLowerCase() === emailLow)) {
-          send(ws, { type: 'ERROR', message: 'Этот email уже зарегистрирован' }); break;
+          send(ws, { type: 'ERROR', message: 'Этот email уже зарегистрирован' });
+          break;
         }
 
         const pub = {
-          id: user.id,
-          name: user.name.trim(),
-          email: emailLow,
-          role: user.role || 'listener',
+          id:          user.id,
+          name:        user.name.trim(),
+          email:       emailLow,
+          role:        user.role || 'listener',
           tracksCount: 0,
-          followers: 0,
-          verified: true,
-          joinedAt: user.joinedAt || new Date().toLocaleDateString('ru-RU'),
+          followers:   0,
+          verified:    true,
+          joinedAt:    user.joinedAt || new Date().toLocaleDateString('ru-RU'),
         };
         state.users.push(pub);
         clientUserMap.set(ws, pub.id);
@@ -196,9 +232,10 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Login existing user ───────────────────────────────────────────────
       case 'LOGIN': {
         const emailLow = (msg.email || '').trim().toLowerCase();
-        const found = state.users.find(u => u.email.trim().toLowerCase() === emailLow);
+        const found    = state.users.find(u => u.email.trim().toLowerCase() === emailLow);
         if (found) {
           clientUserMap.set(ws, found.id);
           send(ws, { type: 'LOGIN_OK', user: found });
@@ -209,9 +246,11 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Upload track ──────────────────────────────────────────────────────
       case 'UPLOAD_TRACK': {
         const { track } = msg;
         if (!track?.id || !track?.title) break;
+        // Strip audioUrl (blob) — server only stores metadata
         const saved = { ...track, audioUrl: undefined };
         if (!state.tracks.some(t => t.id === saved.id)) {
           state.tracks.unshift(saved);
@@ -224,6 +263,7 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Like toggle ───────────────────────────────────────────────────────
       case 'LIKE': {
         const { trackId, userId } = msg;
         const track = state.tracks.find(t => t.id === trackId);
@@ -232,7 +272,7 @@ wss.on('connection', (ws, req) => {
         const already = track._likedBy.includes(userId);
         if (already) {
           track._likedBy = track._likedBy.filter(id => id !== userId);
-          track.likes = Math.max(0, (track.likes || 0) - 1);
+          track.likes    = Math.max(0, (track.likes || 0) - 1);
         } else {
           track._likedBy.push(userId);
           track.likes = (track.likes || 0) + 1;
@@ -246,6 +286,7 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Repost toggle ─────────────────────────────────────────────────────
       case 'REPOST': {
         const { trackId, userId } = msg;
         const track = state.tracks.find(t => t.id === trackId);
@@ -254,7 +295,7 @@ wss.on('connection', (ws, req) => {
         const already = track._repostedBy.includes(userId);
         if (already) {
           track._repostedBy = track._repostedBy.filter(id => id !== userId);
-          track.reposts = Math.max(0, (track.reposts || 0) - 1);
+          track.reposts     = Math.max(0, (track.reposts || 0) - 1);
         } else {
           track._repostedBy.push(userId);
           track.reposts = (track.reposts || 0) + 1;
@@ -268,6 +309,7 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Comment ───────────────────────────────────────────────────────────
       case 'COMMENT': {
         const { trackId, comment } = msg;
         const track = state.tracks.find(t => t.id === trackId);
@@ -291,6 +333,7 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
+      // ── Comment like ──────────────────────────────────────────────────────
       case 'COMMENT_LIKE': {
         const { trackId, commentId, userId } = msg;
         const track = state.tracks.find(t => t.id === trackId);
@@ -299,19 +342,30 @@ wss.on('connection', (ws, req) => {
         if (!c) break;
         if (!c._likedBy) c._likedBy = [];
         const liked = c._likedBy.includes(userId);
-        if (liked) { c._likedBy = c._likedBy.filter(id => id !== userId); c.likes = Math.max(0, (c.likes || 0) - 1); }
-        else        { c._likedBy.push(userId); c.likes = (c.likes || 0) + 1; }
+        if (liked) {
+          c._likedBy = c._likedBy.filter(id => id !== userId);
+          c.likes    = Math.max(0, (c.likes || 0) - 1);
+        } else {
+          c._likedBy.push(userId);
+          c.likes = (c.likes || 0) + 1;
+        }
         saveDb();
         broadcast({ type: 'TRACK_UPDATED', track });
         break;
       }
 
+      // ── Play count ────────────────────────────────────────────────────────
       case 'PLAY': {
         const track = state.tracks.find(t => t.id === msg.trackId);
-        if (track) { track.plays = (track.plays || 0) + 1; saveDb(); broadcast({ type: 'TRACK_UPDATED', track }); }
+        if (track) {
+          track.plays = (track.plays || 0) + 1;
+          saveDb();
+          broadcast({ type: 'TRACK_UPDATED', track });
+        }
         break;
       }
 
+      // ── Follow / unfollow ─────────────────────────────────────────────────
       case 'FOLLOW': {
         const { targetId, followerId } = msg;
         const target = state.users.find(u => u.id === targetId);
@@ -320,7 +374,7 @@ wss.on('connection', (ws, req) => {
         const already = target._followers.includes(followerId);
         if (already) {
           target._followers = target._followers.filter(id => id !== followerId);
-          target.followers = Math.max(0, (target.followers || 0) - 1);
+          target.followers  = Math.max(0, (target.followers || 0) - 1);
         } else {
           target._followers.push(followerId);
           target.followers = (target.followers || 0) + 1;
@@ -338,30 +392,38 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     clientUserMap.delete(ws);
-    console.log(`[WS] -отключение (осталось: ${wss.clients.size})`);
+    console.log(`[WS] -disconnect  (remaining: ${wss.clients.size})`);
   });
   ws.on('error', err => console.error('[WS] error:', err.message));
 });
 
-// ─── START ───────────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, HOST, () => {
   console.log(`
-╔══════════════════════════════════════════════════╗
-║           ClaudMusic Server v5.0                 ║
-╠══════════════════════════════════════════════════╣
-║                                                  ║
-║  🌐  http://localhost:${String(PORT).padEnd(28)}║
-║  📡  ws://localhost:${String(PORT).padEnd(30)}║
-║  💾  data/db.json  (автосохранение)              ║
-║  📊  /api/health   /api/state                    ║
-║                                                  ║
-╠══════════════════════════════════════════════════╣
-║  Деплой на Railway / Render:                     ║
-║    Build:  npm run build                         ║
-║    Start:  node server.js                        ║
-╚══════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════╗
+║            ClaudMusic Server v6.0                 ║
+╠═══════════════════════════════════════════════════╣
+║                                                   ║
+║  🌐  http://localhost:${String(PORT).padEnd(27)}║
+║  📡  WebSocket on same port                       ║
+║  💾  Persistence: data/db.json                    ║
+║  📊  GET /api/health   GET /api/state             ║
+║                                                   ║
+╠═══════════════════════════════════════════════════╣
+║  Railway deploy:                                  ║
+║    Build command : npm run build                  ║
+║    Start command : node server.js                 ║
+║    Port          : 3000  (or $PORT auto)          ║
+╚═══════════════════════════════════════════════════╝
 `);
 });
 
-process.on('SIGTERM', () => { console.log('\n[Server] Сохранение...'); saveDb(); process.exit(0); });
-process.on('SIGINT',  () => { console.log('\n[Server] Сохранение...'); saveDb(); process.exit(0); });
+// ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
+function shutdown(sig) {
+  console.log(`\n[Server] ${sig} — saving DB...`);
+  saveDb();
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));

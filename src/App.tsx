@@ -36,13 +36,43 @@ interface ServerUser {
   tracksCount: number; followers: number; verified: boolean; joinedAt: string; bio?: string;
 }
 
-// ─── WS URL ───────────────────────────────────────────────────────────────────
+// ─── API LAYER ────────────────────────────────────────────────────────────────
+// Detects if we're on Vercel (has /api routes) or local server.js (has WebSocket)
+const isVercel = () => {
+  if (typeof window === 'undefined') return false;
+  const h = window.location.hostname;
+  return h.includes('vercel.app') || h.includes('vercel.com') ||
+         (h !== 'localhost' && h !== '127.0.0.1' && !h.startsWith('192.168.'));
+};
+
+const API_BASE = '';  // relative URLs work both locally and on Vercel
+
+async function apiFetch(path: string, options?: RequestInit) {
+  try {
+    const r = await fetch(API_BASE + path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: r.statusText }));
+      return { error: (err as {error?:string}).error || r.statusText };
+    }
+    return await r.json();
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
+// ─── WS URL (for local server.js mode) ───────────────────────────────────────
 const WS_URL = (() => {
   if (typeof window === 'undefined') return '';
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.hostname;
   const port = window.location.port;
+  // In dev mode (vite :5173), connect to local server.js on :3000
   if (port === '5173' || port === '4173') return `${proto}//${host}:3000`;
+  // On Vercel — no WS, use polling
+  if (isVercel()) return '';
   return `${proto}//${window.location.host}`;
 })();
 
@@ -79,18 +109,18 @@ const GENRES = [
   {name:'Folk',icon:'🪕',gradient:GRADIENTS[5]},
 ];
 
-// ─── SECTION IDs ──────────────────────────────────────────────────────────────
 const SECTIONS = [
-  { id: 'hero', label: 'Главная' },
+  { id: 'hero',     label: 'Главная' },
   { id: 'trending', label: 'В тренде' },
-  { id: 'genres', label: 'Жанры' },
+  { id: 'genres',   label: 'Жанры' },
   { id: 'releases', label: 'Новинки' },
 ];
 
 // ─── LOCAL STORAGE ────────────────────────────────────────────────────────────
-const LS_USER    = 'cm_user_v7';
-const LS_NOTIFS  = 'cm_notifs_v7';
-const LS_FOLLOW  = 'cm_follow_v7';
+const LS_USER   = 'cm_user_v8';
+const LS_NOTIFS = 'cm_notifs_v8';
+const LS_FOLLOW = 'cm_follow_v8';
+const LS_TRACKS = 'cm_tracks_v8'; // local track metadata cache
 
 const loadJson = <T,>(key: string, fallback: T): T => {
   try { const v = localStorage.getItem(key); return v ? (JSON.parse(v) as T) : fallback; } catch { return fallback; }
@@ -99,8 +129,8 @@ const saveJson = <T,>(key: string, val: T) => {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch { /**/ }
 };
 
-const loadLocalUser  = () => loadJson<User|null>(LS_USER, null);
-const saveLocalUser  = (u: User|null) => saveJson(LS_USER, u);
+const loadLocalUser = () => loadJson<User|null>(LS_USER, null);
+const saveLocalUser = (u: User|null) => saveJson(LS_USER, u);
 
 // ─── AUDIO ENGINE ─────────────────────────────────────────────────────────────
 const audioEl = new Audio();
@@ -213,12 +243,12 @@ function VerifiedIcon({size=14}:{size?:number}) {
   );
 }
 
-// ─── WS STATUS ────────────────────────────────────────────────────────────────
-function WsStatus({connected}:{connected:boolean}) {
+// ─── ONLINE STATUS ────────────────────────────────────────────────────────────
+function OnlineStatus({online}:{online:boolean}) {
   return (
     <div style={{display:'flex',alignItems:'center',gap:5}}>
-      <div style={{width:6,height:6,borderRadius:'50%',background:connected?'#34d399':'#F59E0B',animation:connected?'playingPulse 2s ease infinite':'none'}}/>
-      <span style={{fontSize:'0.68rem',color:connected?'#34d399':'#F59E0B',fontWeight:600}}>{connected?'Онлайн':'Офлайн'}</span>
+      <div style={{width:6,height:6,borderRadius:'50%',background:online?'#34d399':'#F59E0B',animation:online?'playingPulse 2s ease infinite':'none'}}/>
+      <span style={{fontSize:'0.68rem',color:online?'#34d399':'#F59E0B',fontWeight:600}}>{online?'Онлайн':'Офлайн'}</span>
     </div>
   );
 }
@@ -271,7 +301,7 @@ function NotificationBell({notifications,onClear,onMarkRead,onNotifClick}:{notif
   );
 }
 
-// ─── INPUT FIELD ──────────────────────────────────────────────────────────────
+// ─── INPUT FIELD (top-level to avoid focus loss) ──────────────────────────────
 interface InputFieldProps {label:string;type?:string;value:string;onChange:(v:string)=>void;placeholder?:string;err?:string;rows?:number;}
 function InputField({label,type='text',value,onChange,placeholder,err,rows}:InputFieldProps) {
   return (
@@ -287,16 +317,21 @@ function InputField({label,type='text',value,onChange,placeholder,err,rows}:Inpu
 }
 
 // ─── AUTH MODAL ───────────────────────────────────────────────────────────────
-interface AuthModalProps {type:'login'|'register';onClose:()=>void;onSuccess:(u:User)=>void;onNotify:(m:string)=>void;wsRef:React.RefObject<WebSocket|null>;serverUsers:ServerUser[];}
-function AuthModal({type:initType,onClose,onSuccess,onNotify,wsRef,serverUsers}:AuthModalProps) {
-  const [mode,setMode]       = useState<'login'|'register'>(initType);
-  const [name,setName]       = useState('');
-  const [email,setEmail]     = useState('');
+interface AuthModalProps {
+  type:'login'|'register'; onClose:()=>void;
+  onSuccess:(u:User)=>void; onNotify:(m:string)=>void;
+  serverUsers: ServerUser[];
+  onlineMode: boolean;
+}
+function AuthModal({type:initType,onClose,onSuccess,onNotify,serverUsers,onlineMode}:AuthModalProps) {
+  const [mode,setMode]         = useState<'login'|'register'>(initType);
+  const [name,setName]         = useState('');
+  const [email,setEmail]       = useState('');
   const [password,setPassword] = useState('');
-  const [role,setRole]       = useState<UserRole>('listener');
-  const [agreed,setAgreed]   = useState(false);
-  const [loading,setLoading] = useState(false);
-  const [errors,setErrors]   = useState<Record<string,string>>({});
+  const [role,setRole]         = useState<UserRole>('listener');
+  const [agreed,setAgreed]     = useState(false);
+  const [loading,setLoading]   = useState(false);
+  const [errors,setErrors]     = useState<Record<string,string>>({});
 
   useEffect(()=>{
     const fn=(e:KeyboardEvent)=>{if(e.key==='Escape')onClose();};
@@ -317,7 +352,7 @@ function AuthModal({type:initType,onClose,onSuccess,onNotify,wsRef,serverUsers}:
     return Object.keys(err).length===0;
   };
 
-  const handleSubmit=(e:React.FormEvent)=>{
+  const handleSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();
     if(!validate()) return;
     setLoading(true);
@@ -330,49 +365,59 @@ function AuthModal({type:initType,onClose,onSuccess,onNotify,wsRef,serverUsers}:
         role, followers:0, following:0, tracksCount:0, verified:true,
         joinedAt:new Date().toLocaleDateString('ru-RU'),
       };
-      const ws=wsRef.current;
-      if(ws&&ws.readyState===WebSocket.OPEN){
-        const handle=(ev:MessageEvent)=>{
-          let msg:{type:string;message?:string;user?:ServerUser};
-          try{msg=JSON.parse(ev.data);}catch{return;}
-          if(msg.type==='REGISTER_OK'||msg.type==='ERROR'){
-            ws.removeEventListener('message',handle); setLoading(false);
-            if(msg.type==='ERROR'){ setErrors({name:msg.message||'Ошибка'}); }
-            else { onSuccess(user); onClose(); onNotify('🎉 Добро пожаловать в ClaudMusic!'); }
-          }
-        };
-        ws.addEventListener('message',handle);
-        ws.send(JSON.stringify({type:'REGISTER',user}));
+
+      if(onlineMode){
+        const res = await apiFetch('/api/register', {
+          method:'POST',
+          body: JSON.stringify({user}),
+        });
+        setLoading(false);
+        if(res.error){ setErrors({name:res.error}); return; }
+        // Use server-returned user data
+        const serverUser = res.user as ServerUser;
+        const finalUser:User = {...user, id:serverUser.id, tracksCount:serverUser.tracksCount||0};
+        onSuccess(finalUser);
+        onClose();
+        onNotify('🎉 Добро пожаловать в ClaudMusic!');
       } else {
-        setTimeout(()=>{setLoading(false);onSuccess(user);onClose();onNotify('🎉 Аккаунт создан!');},600);
-      }
-    } else {
-      const ws=wsRef.current;
-      if(ws&&ws.readyState===WebSocket.OPEN){
-        const handle=(ev:MessageEvent)=>{
-          let msg:{type:string;user?:ServerUser};
-          try{msg=JSON.parse(ev.data);}catch{return;}
-          if(msg.type==='LOGIN_OK'||msg.type==='LOGIN_NOT_FOUND'){
-            ws.removeEventListener('message',handle); setLoading(false);
-            if(msg.type==='LOGIN_NOT_FOUND'){ setErrors({email:'Аккаунт не найден'}); }
-            else if(msg.user){
-              const su=msg.user;
-              const user:User={id:su.id,name:su.name,email:su.email,avatar:GRADIENTS[Math.abs(su.name.charCodeAt(0)%GRADIENTS.length)],role:su.role||'listener',followers:su.followers||0,following:0,tracksCount:su.tracksCount||0,verified:true,joinedAt:su.joinedAt};
-              onSuccess(user); onClose(); onNotify(`👋 С возвращением, ${su.name}!`);
-            }
-          }
-        };
-        ws.addEventListener('message',handle);
-        ws.send(JSON.stringify({type:'LOGIN',email:email.trim().toLowerCase()}));
-      } else {
+        // Offline mode: just save locally
         setTimeout(()=>{
           setLoading(false);
-          const su=serverUsers.find(u=>u.email.toLowerCase()===email.trim().toLowerCase());
-          if(su){
-            const user:User={id:su.id,name:su.name,email:su.email,avatar:GRADIENTS[0],role:su.role||'listener',followers:su.followers||0,following:0,tracksCount:su.tracksCount||0,verified:true,joinedAt:su.joinedAt};
-            onSuccess(user); onClose(); onNotify(`👋 С возвращением, ${su.name}!`);
-          } else { setErrors({email:'Аккаунт не найден'}); }
-        },500);
+          onSuccess(user);
+          onClose();
+          onNotify('🎉 Аккаунт создан (офлайн режим)!');
+        },400);
+      }
+
+    } else {
+      // Login
+      if(onlineMode){
+        const res = await apiFetch('/api/login', {
+          method:'POST',
+          body: JSON.stringify({email:email.trim().toLowerCase()}),
+        });
+        setLoading(false);
+        if(res.error){ setErrors({email:res.error}); return; }
+        const su = res.user as ServerUser;
+        const user:User={
+          id:su.id, name:su.name, email:su.email,
+          avatar:GRADIENTS[Math.abs(su.name.charCodeAt(0)%GRADIENTS.length)],
+          role:su.role||'listener', followers:su.followers||0, following:0,
+          tracksCount:su.tracksCount||0, verified:true, joinedAt:su.joinedAt,
+        };
+        onSuccess(user);
+        onClose();
+        onNotify(`👋 С возвращением, ${su.name}!`);
+      } else {
+        // Offline: find in local cache
+        const found = serverUsers.find(u=>u.email.toLowerCase()===email.trim().toLowerCase());
+        setLoading(false);
+        if(found){
+          const user:User={id:found.id,name:found.name,email:found.email,avatar:GRADIENTS[0],role:found.role||'listener',followers:found.followers||0,following:0,tracksCount:found.tracksCount||0,verified:true,joinedAt:found.joinedAt};
+          onSuccess(user); onClose(); onNotify(`👋 С возвращением, ${found.name}!`);
+        } else {
+          setErrors({email:'Аккаунт не найден. Сервер недоступен.'});
+        }
       }
     }
   };
@@ -436,8 +481,8 @@ function AuthModal({type:initType,onClose,onSuccess,onNotify,wsRef,serverUsers}:
 }
 
 // ─── UPLOAD MODAL ─────────────────────────────────────────────────────────────
-interface UploadModalProps {onClose:()=>void;onUpload:(t:Track)=>void;onNotify:(m:string)=>void;userName:string;userId:string;}
-function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProps) {
+interface UploadModalProps {onClose:()=>void;onUpload:(t:Track)=>void;onNotify:(m:string)=>void;userName:string;userId:string;onlineMode:boolean;}
+function UploadModal({onClose,onUpload,onNotify,userName,userId,onlineMode}:UploadModalProps) {
   const [isDragOver,setIsDragOver] = useState(false);
   const [file,setFile]             = useState<File|null>(null);
   const [coverFile,setCoverFile]   = useState<File|null>(null);
@@ -454,6 +499,7 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
   const [pendingTrack,setPendingTrack] = useState<Track|null>(null);
   const fileRef  = useRef<HTMLInputElement>(null);
   const coverRef = useRef<HTMLInputElement>(null);
+  void coverFile;
 
   useEffect(()=>{
     const fn=(e:KeyboardEvent)=>{if(e.key==='Escape')onClose();};
@@ -488,7 +534,7 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
     return Object.keys(err).length===0;
   };
 
-  const handlePublish=()=>{
+  const handlePublish=async()=>{
     if(!validate()||!file) return;
     setUploading(true);
     const track:Track={
@@ -504,6 +550,15 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
       isUserTrack:true, audioUrl:blobUrl,
     };
     setPendingTrack(track);
+
+    // Send metadata to server (no audio blob)
+    if(onlineMode){
+      await apiFetch('/api/track', {
+        method:'POST',
+        body: JSON.stringify({track:{...track,audioUrl:undefined,coverImage:undefined}}),
+      });
+    }
+
     let p=0;
     const iv=setInterval(()=>{p+=Math.random()*9+5;if(p>=100){clearInterval(iv);setProgress(100);setUploading(false);setDone(true);}else setProgress(Math.min(p,100));},100);
   };
@@ -513,7 +568,6 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
     onClose();
   };
 
-  void coverFile;
   const genreList=['Electronic','Hip-Hop','Rock','Lo-Fi','Jazz','Classical','Pop','Indie','Synthwave','R&B','Metal','Folk','Другое'];
 
   return (
@@ -573,7 +627,6 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
                   <div style={{fontSize:'0.65rem',color:'#475569',marginTop:4}}>JPG, PNG, WEBP — рекомендуется 1:1</div>
                 </div>
               </div>
-              {errors.cover&&<div style={{color:'#EF4444',fontSize:'0.73rem',marginTop:5}}>{errors.cover}</div>}
             </div>
 
             <div style={{display:'flex',flexDirection:'column',gap:11,marginBottom:16}}>
@@ -613,8 +666,8 @@ function UploadModal({onClose,onUpload,onNotify,userName,userId}:UploadModalProp
 }
 
 // ─── COMMENTS MODAL ───────────────────────────────────────────────────────────
-interface CommentsModalProps {track:Track;user:User|null;onClose:()=>void;onUpdateTrack:(t:Track)=>void;onRequestLogin:()=>void;wsRef:React.RefObject<WebSocket|null>;}
-function CommentsModal({track,user,onClose,onUpdateTrack,onRequestLogin,wsRef}:CommentsModalProps) {
+interface CommentsModalProps {track:Track;user:User|null;onClose:()=>void;onUpdateTrack:(t:Track)=>void;onRequestLogin:()=>void;onlineMode:boolean;}
+function CommentsModal({track,user,onClose,onUpdateTrack,onRequestLogin,onlineMode}:CommentsModalProps) {
   const [text,setText]     = useState('');
   const [replyTo,setReplyTo] = useState<{id:string;userName:string;text:string}|null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -625,7 +678,7 @@ function CommentsModal({track,user,onClose,onUpdateTrack,onRequestLogin,wsRef}:C
     return ()=>window.removeEventListener('keydown',fn);
   },[onClose]);
 
-  const postComment=()=>{
+  const postComment=async()=>{
     if(!text.trim()||!user) return;
     const c:Comment={
       id:'c_'+Date.now()+'_'+Math.random().toString(36).slice(2),
@@ -634,17 +687,19 @@ function CommentsModal({track,user,onClose,onUpdateTrack,onRequestLogin,wsRef}:C
       isAuthor:user.id===track.artistId,
       replyTo:replyTo||undefined,
     };
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'COMMENT',trackId:track.id,comment:c}));
+    if(onlineMode){
+      await apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'COMMENT',trackId:track.id,comment:c})});
+    }
     onUpdateTrack({...track,comments:[...track.comments,c]});
     setText(''); setReplyTo(null);
     setTimeout(()=>bottomRef.current?.scrollIntoView({behavior:'smooth'}),100);
   };
 
-  const likeComment=(cid:string)=>{
+  const likeComment=async(cid:string)=>{
     if(!user) return;
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'COMMENT_LIKE',trackId:track.id,commentId:cid,userId:user.id}));
+    if(onlineMode){
+      await apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'COMMENT_LIKE',trackId:track.id,commentId:cid,userId:user.id})});
+    }
     onUpdateTrack({...track,comments:track.comments.map(c=>c.id===cid?{...c,liked:!c.liked,likes:c.liked?c.likes-1:c.likes+1}:c)});
   };
 
@@ -828,8 +883,8 @@ function ProfileModal({artist,tracks,currentUser,onClose,onPlayTrack,onFollowTog
 }
 
 // ─── PLAYER BAR ───────────────────────────────────────────────────────────────
-interface PlayerBarProps {track:Track;isPlaying:boolean;onPlayPause:()=>void;onNext:()=>void;onPrev:()=>void;onOpenComments:(t:Track)=>void;onDownload:(t:Track)=>void;wsRef:React.RefObject<WebSocket|null>;}
-function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onDownload,wsRef}:PlayerBarProps) {
+interface PlayerBarProps {track:Track;isPlaying:boolean;onPlayPause:()=>void;onNext:()=>void;onPrev:()=>void;onOpenComments:(t:Track)=>void;onDownload:(t:Track)=>void;onlineMode:boolean;}
+function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onDownload,onlineMode}:PlayerBarProps) {
   const [progress,setProgress]     = useState(0);
   const [currentTime,setCurrentTime] = useState(0);
   const [totalTime,setTotalTime]   = useState(0);
@@ -839,8 +894,8 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
   const wantPlayRef    = useRef(false);
   const playCountedRef = useRef('');
   const canPlayRef     = useRef(false);
+  void onlineMode;
 
-  // Load track
   useEffect(()=>{
     setProgress(0); setCurrentTime(0); setTotalTime(0); canPlayRef.current=false;
     if(!track.audioUrl){ audioEl.pause(); audioEl.src=''; setNoAudio(true); return; }
@@ -852,14 +907,13 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
       canPlayRef.current=true;
       if(wantPlayRef.current){ const p=audioEl.play(); if(p) p.catch(err=>console.warn('[Audio]',err.message)); }
     };
-    const onError=()=>setNoAudio(true);
+    const onError=()=>{ console.warn('[Audio] Error loading track'); setNoAudio(true); };
     audioEl.addEventListener('canplay',onCanPlay,{once:true});
     audioEl.addEventListener('error',onError,{once:true});
     return ()=>{ audioEl.removeEventListener('canplay',onCanPlay); audioEl.removeEventListener('error',onError); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[track.id, track.audioUrl]);
 
-  // Play/pause sync
   useEffect(()=>{
     wantPlayRef.current=isPlaying;
     if(!track.audioUrl||!canPlayRef.current) return;
@@ -867,13 +921,12 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
       const p=audioEl.play(); if(p) p.catch(e=>console.warn('[Audio]',e.message));
       if(playCountedRef.current!==track.id){
         playCountedRef.current=track.id;
-        const ws=wsRef.current;
-        if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'PLAY',trackId:track.id}));
+        // Report play to server
+        apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'PLAY',trackId:track.id})}).catch(()=>{});
       }
     } else { audioEl.pause(); }
-  },[isPlaying, track.audioUrl, track.id, wsRef]);
+  },[isPlaying, track.audioUrl, track.id]);
 
-  // Audio events
   useEffect(()=>{
     const onTime=()=>{ setCurrentTime(audioEl.currentTime); if(audioEl.duration&&isFinite(audioEl.duration)){ setTotalTime(audioEl.duration); setProgress(audioEl.currentTime/audioEl.duration*100); }};
     const onEnded=()=>{ if(isRepeat){ audioEl.currentTime=0; audioEl.play().catch(()=>{}); } else onNext(); };
@@ -940,7 +993,6 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
 
       {/* Desktop */}
       <div className="hide-mobile" style={{padding:'0 20px',height:74,display:'flex',alignItems:'center',gap:14}}>
-        {/* Track info */}
         <div style={{display:'flex',alignItems:'center',gap:10,width:220,flexShrink:0,minWidth:0}}>
           <CoverArt gradient={track.coverGradient} image={track.coverImage} size={42}/>
           <div style={{minWidth:0}}>
@@ -949,7 +1001,6 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
             {noAudio&&<div style={{fontSize:'0.56rem',color:'#F59E0B',marginTop:1}}>Загрузи трек для воспроизведения</div>}
           </div>
         </div>
-        {/* Center */}
         <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:5,minWidth:0}}>
           <div style={{display:'flex',alignItems:'center',gap:10}}>
             <PrevBtn/><PlayBtn/><NextBtn/>
@@ -967,7 +1018,6 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
             <span style={{fontSize:'0.62rem',color:'#475569',width:28,flexShrink:0}}>{totalTime>0?fmtTime(totalTime):track.duration}</span>
           </div>
         </div>
-        {/* Right */}
         <div style={{display:'flex',alignItems:'center',gap:8,width:160,justifyContent:'flex-end',flexShrink:0}}>
           <button onClick={()=>onOpenComments(track)} title="Комментарии" style={{background:'none',border:'none',cursor:'pointer',color:'#475569',padding:4,transition:'color 0.2s'}}
             onMouseEnter={e=>(e.currentTarget.style.color='#f8fafc')} onMouseLeave={e=>(e.currentTarget.style.color='#475569')}>
@@ -989,13 +1039,13 @@ function PlayerBar({track,isPlaying,onPlayPause,onNext,onPrev,onOpenComments,onD
 // ─── HEADER ───────────────────────────────────────────────────────────────────
 interface HeaderProps {
   user:User|null; onOpenModal:(t:ModalType)=>void; onLogout:()=>void;
-  activeSection:string; onNavClick:(s:string)=>void; wsConnected:boolean;
+  activeSection:string; onNavClick:(s:string)=>void; online:boolean;
   notifications:AppNotification[]; onClearNotifs:()=>void; onMarkNotifsRead:()=>void;
   onNotifClick:(n:AppNotification)=>void;
   onSearchSubmit:(q:string)=>void;
   onOpenProfile:()=>void;
 }
-function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,notifications,onClearNotifs,onMarkNotifsRead,onNotifClick,onSearchSubmit,onOpenProfile}:HeaderProps) {
+function Header({user,onOpenModal,onLogout,activeSection,onNavClick,online,notifications,onClearNotifs,onMarkNotifsRead,onNotifClick,onSearchSubmit,onOpenProfile}:HeaderProps) {
   const [menuOpen,setMenuOpen] = useState(false);
   const [showUser,setShowUser] = useState(false);
   const [inputVal,setInputVal] = useState('');
@@ -1012,15 +1062,11 @@ function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,
     if(e.key==='Escape'){ setInputVal(''); onSearchSubmit(''); }
   };
 
-  const handleNavClick=(id:string)=>{
-    onNavClick(id);
-    setMenuOpen(false);
-  };
+  const handleNavClick=(id:string)=>{ onNavClick(id); setMenuOpen(false); };
 
   return (
     <header style={{position:'fixed',top:0,left:0,right:0,zIndex:100,borderBottom:'1px solid rgba(255,255,255,0.06)'}} className="glass-strong">
       <div style={{maxWidth:1280,margin:'0 auto',padding:'0 20px',height:62,display:'flex',alignItems:'center',gap:14}}>
-        {/* Logo */}
         <div onClick={()=>handleNavClick('hero')} style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',flexShrink:0}}>
           <div style={{width:34,height:34,background:'linear-gradient(135deg,#8B5CF6,#3B82F6)',borderRadius:9,display:'flex',alignItems:'center',justifyContent:'center',boxShadow:'0 0 14px rgba(139,92,246,0.35)'}}>
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M2 12C2 12 4 4 6 4C8 4 8 20 10 20C12 20 12 8 14 8C16 8 16 16 18 16C20 16 22 12 22 12" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1028,7 +1074,6 @@ function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,
           <span style={{fontWeight:800,fontSize:'1.05rem',color:'#f8fafc',letterSpacing:'-0.5px'}}>ClaudMusic</span>
         </div>
 
-        {/* Nav */}
         <nav style={{display:'flex',gap:1,flex:1}} className="hide-mobile">
           {SECTIONS.map(n=>(
             <button key={n.id} onClick={()=>handleNavClick(n.id)}
@@ -1040,7 +1085,6 @@ function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,
           ))}
         </nav>
 
-        {/* Search */}
         <div style={{position:'relative',flex:'0 0 195px'}} className="hide-mobile">
           <svg style={{position:'absolute',left:11,top:'50%',transform:'translateY(-50%)',pointerEvents:'none'}} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input className="input-dark" style={{paddingLeft:30,borderRadius:100,fontSize:'0.82rem'}} placeholder="Поиск... (Enter)"
@@ -1051,7 +1095,7 @@ function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,
         </div>
 
         <div style={{display:'flex',gap:7,flexShrink:0,alignItems:'center'}}>
-          <div className="hide-mobile"><WsStatus connected={wsConnected}/></div>
+          <div className="hide-mobile"><OnlineStatus online={online}/></div>
           {user?(
             <>
               <NotificationBell notifications={notifications} onClear={onClearNotifs} onMarkRead={onMarkNotifsRead} onNotifClick={onNotifClick}/>
@@ -1096,13 +1140,11 @@ function Header({user,onOpenModal,onLogout,activeSection,onNavClick,wsConnected,
               <button onClick={()=>onOpenModal('register')} className="btn-glow" style={{border:'none',borderRadius:100,padding:'6px 16px',cursor:'pointer',color:'white',fontWeight:700,fontSize:'0.85rem',fontFamily:'Inter,sans-serif'}}><span>Регистрация</span></button>
             </>
           )}
-          {/* Mobile burger */}
           <button className="show-mobile" onClick={()=>setMenuOpen(p=>!p)} style={{background:'rgba(255,255,255,0.06)',border:'none',borderRadius:8,width:34,height:34,cursor:'pointer',color:'#f8fafc',display:'none',alignItems:'center',justifyContent:'center'}}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
           </button>
         </div>
       </div>
-      {/* Mobile menu */}
       {menuOpen&&(
         <div className="glass-strong" style={{padding:'8px 20px 16px',borderTop:'1px solid rgba(255,255,255,0.06)',display:'flex',flexDirection:'column',gap:2}}>
           {SECTIONS.map(n=>(
@@ -1288,11 +1330,11 @@ const DUMMY_TRACK:Track={id:'__dummy__',title:'— Нет трека —',artist
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 export function App() {
   const [user,setUser]                 = useState<User|null>(loadLocalUser);
-  const [tracks,setTracks]             = useState<Track[]>([]);
+  const [tracks,setTracks]             = useState<Track[]>(()=>loadJson<Track[]>(LS_TRACKS,[]));
   const [serverUsers,setServerUsers]   = useState<ServerUser[]>([]);
   const [currentTrack,setCurrentTrack] = useState<Track>(DUMMY_TRACK);
   const [isPlaying,setIsPlaying]       = useState(false);
-  const [wsConnected,setWsConnected]   = useState(false);
+  const [online,setOnline]             = useState(false);
   const [modal,setModal]               = useState<ModalType>(null);
   const [commentTrack,setCommentTrack] = useState<Track|null>(null);
   const [profileArtistId,setProfileArtistId] = useState<string|null>(null);
@@ -1303,60 +1345,72 @@ export function App() {
   const [searchQuery,setSearchQuery]   = useState('');
   const [showSearch,setShowSearch]     = useState(false);
   const [followingIds,setFollowingIds] = useState<string[]>(()=>loadJson(LS_FOLLOW,[]));
+  const [lastPollTs,setLastPollTs]     = useState(0);
 
   const audioUrlMapRef = useRef<Record<string,string>>({});
   const wsRef          = useRef<WebSocket|null>(null);
   const reconnRef      = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const pollRef        = useRef<ReturnType<typeof setInterval>|null>(null);
 
-  // Persist user
+  // ─── PERSIST ──────────────────────────────────────────────────────────────
   useEffect(()=>{ saveLocalUser(user); },[user]);
-  // Persist notifications
   useEffect(()=>{ saveJson(LS_NOTIFS, notifications); },[notifications]);
-  // Persist following
   useEffect(()=>{ saveJson(LS_FOLLOW, followingIds); },[followingIds]);
+  useEffect(()=>{
+    // Save track metadata (without audioUrl blobs) to localStorage
+    const toSave = tracks.map(t=>({...t,audioUrl:undefined,coverImage:undefined}));
+    saveJson(LS_TRACKS, toSave);
+  },[tracks]);
 
-  // ─── WEBSOCKET ──────────────────────────────────────────────────────────────
+  // ─── WEBSOCKET (local server mode) ─────────────────────────────────────────
   const connectWs=useCallback(()=>{
-    if(!WS_URL) return;
+    if(!WS_URL) return; // Vercel mode — skip WS
     try {
       const ws=new WebSocket(WS_URL);
       wsRef.current=ws;
       ws.onopen=()=>{
-        setWsConnected(true);
+        setOnline(true);
         const u=loadLocalUser();
         ws.send(JSON.stringify({type:'INIT',userId:u?.id}));
       };
       ws.onmessage=(ev)=>{
         let msg:Record<string,unknown>;
         try{msg=JSON.parse(ev.data);}catch{return;}
-        switch(msg.type) {
+        switch(msg.type){
           case 'STATE': {
             const st=(msg.tracks as Track[])||[];
             setServerUsers((msg.users as ServerUser[])||[]);
             setTracks(prev=>{
-              const localIds=new Set(prev.map(t=>t.id));
-              const fresh=st.filter(t=>!localIds.has(t.id));
-              return [...prev,...fresh];
+              const localMap=new Map(prev.map(t=>[t.id,t]));
+              const merged=[...prev];
+              for(const t of st){
+                if(!localMap.has(t.id)){
+                  merged.push({...t,audioUrl:audioUrlMapRef.current[t.id]});
+                }
+              }
+              return merged;
             });
             break;
           }
           case 'TRACK_ADDED': {
             const t=msg.track as Track;
-            setTracks(prev=>prev.some(x=>x.id===t.id)?prev:[t,...prev]);
+            setTracks(prev=>prev.some(x=>x.id===t.id)?prev:[{...t,audioUrl:audioUrlMapRef.current[t.id]},...prev]);
             break;
           }
           case 'TRACK_UPDATED': {
             const upd=msg.track as Track;
             setTracks(prev=>prev.map(t=>{
               if(t.id!==upd.id) return t;
-              const url=audioUrlMapRef.current[t.id]||t.audioUrl;
-              return{...upd,audioUrl:url,liked:t.liked,reposted:t.reposted,coverImage:t.coverImage||upd.coverImage};
+              return {...upd,audioUrl:audioUrlMapRef.current[t.id]||t.audioUrl,liked:t.liked,reposted:t.reposted,coverImage:t.coverImage||upd.coverImage};
             }));
-            setCommentTrack(prev=>{if(!prev||prev.id!==upd.id) return prev;const url=audioUrlMapRef.current[prev.id]||prev.audioUrl;return{...upd,audioUrl:url,liked:prev.liked,reposted:prev.reposted};});
+            setCommentTrack(prev=>{if(!prev||prev.id!==upd.id)return prev;return{...upd,audioUrl:audioUrlMapRef.current[prev.id]||prev.audioUrl,liked:prev.liked,reposted:prev.reposted};});
             break;
           }
-          case 'REGISTER_OK':case 'USER_REGISTERED': {const u=msg.user as ServerUser;if(u)setServerUsers(prev=>[...prev.filter(x=>x.id!==u.id),u]);break;}
-          case 'USER_UPDATED': {const u=msg.user as ServerUser;if(u)setServerUsers(prev=>prev.map(x=>x.id===u.id?u:x));break;}
+          case 'USER_REGISTERED':case 'USER_UPDATED': {
+            const u=msg.user as ServerUser;
+            if(u)setServerUsers(prev=>[...prev.filter(x=>x.id!==u.id),u]);
+            break;
+          }
           case 'NOTIFICATION': {
             const n=msg.notification as AppNotification;
             if(!n) break;
@@ -1367,13 +1421,63 @@ export function App() {
           default: break;
         }
       };
-      ws.onclose=()=>{setWsConnected(false);wsRef.current=null;reconnRef.current=setTimeout(connectWs,3000);};
+      ws.onclose=()=>{setOnline(false);wsRef.current=null;reconnRef.current=setTimeout(connectWs,3000);};
       ws.onerror=()=>ws.close();
     } catch {reconnRef.current=setTimeout(connectWs,5000);}
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
-  useEffect(()=>{connectWs();return()=>{if(reconnRef.current)clearTimeout(reconnRef.current);wsRef.current?.close();};},[connectWs]);
+  // ─── HTTP POLLING (Vercel mode) ────────────────────────────────────────────
+  const pollServer=useCallback(async()=>{
+    try {
+      const data=await apiFetch('/api/state');
+      if(data.error) { setOnline(false); return; }
+      setOnline(true);
+      setLastPollTs(data.ts||0);
+      const serverTracks=(data.tracks as Track[])||[];
+      const serverUsrs=(data.users as ServerUser[])||[];
+      setServerUsers(serverUsrs);
+      setTracks(prev=>{
+        const localMap=new Map(prev.map((t:Track)=>[t.id,t]));
+        const merged=[...prev];
+        for(const t of serverTracks){
+          if(!localMap.has(t.id)){
+            merged.push({...t,audioUrl:audioUrlMapRef.current[t.id]});
+          } else {
+            // Update server-synced fields only (likes, plays, reposts, comments)
+            const local=localMap.get(t.id)!;
+            const idx=merged.findIndex(x=>x.id===t.id);
+            if(idx>=0) merged[idx]={
+              ...t,
+              audioUrl:local.audioUrl||audioUrlMapRef.current[t.id],
+              liked:local.liked,
+              reposted:local.reposted,
+              coverImage:local.coverImage||t.coverImage,
+            };
+          }
+        }
+        return merged;
+      });
+    } catch { setOnline(false); }
+  },[]);
+
+  useEffect(()=>{
+    if(WS_URL){
+      // Local server.js mode
+      connectWs();
+    } else {
+      // Vercel/HTTP mode
+      pollServer();
+      pollRef.current=setInterval(pollServer,5000); // poll every 5s
+    }
+    return ()=>{
+      if(reconnRef.current) clearTimeout(reconnRef.current);
+      wsRef.current?.close();
+      if(pollRef.current) clearInterval(pollRef.current);
+    };
+  },[connectWs,pollServer]);
+
+  void lastPollTs;
 
   // ─── SCROLL REVEAL ──────────────────────────────────────────────────────────
   useEffect(()=>{
@@ -1393,14 +1497,13 @@ export function App() {
       }
     };
     window.addEventListener('scroll',fn,{passive:true});
-    fn(); // run on mount
+    fn();
     return()=>window.removeEventListener('scroll',fn);
   },[]);
 
   const notify=useCallback((msg:string)=>{const id=Date.now();setToasts(p=>[...p,{id,msg}]);},[]);
   const removeToast=useCallback((id:number)=>setToasts(p=>p.filter(t=>t.id!==id)),[]);
 
-  // ─── NAV SCROLL ─────────────────────────────────────────────────────────────
   const scrollTo=useCallback((id:string)=>{
     const el=document.getElementById(id);
     if(el){
@@ -1435,18 +1538,25 @@ export function App() {
     setIsPlaying(true);
   },[tracks,currentTrack.id]);
 
-  const handleLike=useCallback((id:string)=>{
+  const handleLike=useCallback(async(id:string)=>{
     if(!user){notify('👆 Войди, чтобы ставить лайки');setModal('login');return;}
     setTracks(ts=>ts.map(t=>t.id===id?{...t,liked:!t.liked,likes:t.liked?t.likes-1:t.likes+1}:t));
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'LIKE',trackId:id,userId:user.id}));
+    // Send to server
+    if(WS_URL&&wsRef.current?.readyState===WebSocket.OPEN){
+      wsRef.current.send(JSON.stringify({type:'LIKE',trackId:id,userId:user.id}));
+    } else {
+      await apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'LIKE',trackId:id,userId:user.id})});
+    }
   },[user,notify]);
 
-  const handleRepost=useCallback((id:string)=>{
+  const handleRepost=useCallback(async(id:string)=>{
     if(!user){notify('👆 Войди, чтобы делать репосты');setModal('login');return;}
     setTracks(ts=>ts.map(t=>t.id===id?{...t,reposted:!t.reposted,reposts:t.reposted?t.reposts-1:t.reposts+1}:t));
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'REPOST',trackId:id,userId:user.id}));
+    if(WS_URL&&wsRef.current?.readyState===WebSocket.OPEN){
+      wsRef.current.send(JSON.stringify({type:'REPOST',trackId:id,userId:user.id}));
+    } else {
+      await apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'REPOST',trackId:id,userId:user.id})});
+    }
   },[user,notify]);
 
   const handleDownload=useCallback((track:Track)=>{
@@ -1465,8 +1575,9 @@ export function App() {
 
   const handleLogin=useCallback((u:User)=>{
     setUser(u);
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'IDENTIFY',userId:u.id}));
+    if(WS_URL&&wsRef.current?.readyState===WebSocket.OPEN){
+      wsRef.current.send(JSON.stringify({type:'IDENTIFY',userId:u.id}));
+    }
   },[]);
 
   const handleLogout=useCallback(()=>{
@@ -1475,15 +1586,20 @@ export function App() {
     notify('👋 Вы вышли из аккаунта');
   },[notify]);
 
-  const handleUpload=useCallback((track:Track)=>{
+  const handleUpload=useCallback(async(track:Track)=>{
     const withUser={...track,artist:user?.name||'Артист',artistId:user?.id||''};
     if(withUser.audioUrl) audioUrlMapRef.current[withUser.id]=withUser.audioUrl;
     setTracks(ts=>[withUser,...ts]);
     setUser(u=>u?{...u,tracksCount:u.tracksCount+1}:u);
     setCurrentTrack(withUser);
     setTimeout(()=>setIsPlaying(true),120);
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'UPLOAD_TRACK',track:{...withUser,audioUrl:undefined}}));
+    // Send to server (metadata only, no blob)
+    const trackForServer={...withUser,audioUrl:undefined,coverImage:undefined};
+    if(WS_URL&&wsRef.current?.readyState===WebSocket.OPEN){
+      wsRef.current.send(JSON.stringify({type:'UPLOAD_TRACK',track:trackForServer}));
+    } else {
+      await apiFetch('/api/track',{method:'POST',body:JSON.stringify({track:trackForServer})});
+    }
   },[user]);
 
   const openUpload=useCallback(()=>{
@@ -1492,12 +1608,15 @@ export function App() {
     setModal('upload');
   },[user,notify]);
 
-  const handleFollowToggle=useCallback((artistId:string)=>{
+  const handleFollowToggle=useCallback(async(artistId:string)=>{
     if(!user){notify('👆 Войди, чтобы подписаться');setModal('login');return;}
     const isFollowing=followingIds.includes(artistId);
     setFollowingIds(prev=>isFollowing?prev.filter(id=>id!==artistId):[...prev,artistId]);
-    const ws=wsRef.current;
-    if(ws&&ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'FOLLOW',targetId:artistId,followerId:user.id}));
+    if(WS_URL&&wsRef.current?.readyState===WebSocket.OPEN){
+      wsRef.current.send(JSON.stringify({type:'FOLLOW',targetId:artistId,followerId:user.id}));
+    } else {
+      await apiFetch('/api/action',{method:'POST',body:JSON.stringify({type:'FOLLOW',targetId:artistId,followerId:user.id})});
+    }
     notify(isFollowing?'Отписка оформлена':'✓ Подписка оформлена');
   },[user,followingIds,notify]);
 
@@ -1549,7 +1668,7 @@ export function App() {
         onLogout={handleLogout}
         activeSection={activeSection}
         onNavClick={scrollTo}
-        wsConnected={wsConnected}
+        online={online}
         notifications={notifications}
         onClearNotifs={()=>setNotifications([])}
         onMarkNotifsRead={()=>setNotifications(prev=>prev.map(n=>({...n,read:true})))}
@@ -1560,7 +1679,7 @@ export function App() {
 
       <main style={{paddingTop:62,paddingBottom:90,position:'relative',zIndex:1}}>
 
-        {/* ─── HERO ─── */}
+        {/* HERO */}
         <section id="hero" style={{minHeight:'88vh',display:'flex',alignItems:'center',justifyContent:'center',padding:'clamp(50px,9vw,110px) 20px',overflow:'hidden'}}>
           <div style={{textAlign:'center',maxWidth:780}}>
             <div className="fade-in-up" style={{display:'inline-flex',alignItems:'center',gap:7,background:'rgba(139,92,246,0.1)',border:'1px solid rgba(139,92,246,0.25)',borderRadius:100,padding:'5px 16px',fontSize:'0.7rem',fontWeight:700,color:'#a78bfa',textTransform:'uppercase',letterSpacing:1,marginBottom:24}}>
@@ -1596,7 +1715,7 @@ export function App() {
           </div>
         </section>
 
-        {/* ─── TRENDING ─── */}
+        {/* TRENDING */}
         <section id="trending" style={{padding:'clamp(44px,6vw,80px) 0'}}>
           <div style={{maxWidth:1280,margin:'0 auto',padding:'0 20px'}}>
             <div className="reveal" style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:22}}>
@@ -1623,7 +1742,7 @@ export function App() {
           </div>
         </section>
 
-        {/* ─── GENRES ─── */}
+        {/* GENRES */}
         <section id="genres" style={{padding:'clamp(44px,6vw,80px) 0',background:'rgba(255,255,255,0.01)'}}>
           <div style={{maxWidth:1280,margin:'0 auto',padding:'0 20px'}}>
             <div className="reveal" style={{textAlign:'center',marginBottom:28}}>
@@ -1648,7 +1767,7 @@ export function App() {
           </div>
         </section>
 
-        {/* ─── NEW RELEASES ─── */}
+        {/* NEW RELEASES */}
         <section id="releases" style={{padding:'clamp(44px,6vw,80px) 0'}}>
           <div style={{maxWidth:1280,margin:'0 auto',padding:'0 20px'}}>
             <div className="reveal" style={{marginBottom:22}}>
@@ -1678,7 +1797,7 @@ export function App() {
           </div>
         </section>
 
-        {/* ─── WHY ─── */}
+        {/* WHY */}
         <section id="why" style={{padding:'clamp(44px,6vw,80px) 0',background:'rgba(255,255,255,0.01)'}}>
           <div style={{maxWidth:1280,margin:'0 auto',padding:'0 20px'}}>
             <div className="reveal" style={{textAlign:'center',marginBottom:34}}>
@@ -1695,7 +1814,6 @@ export function App() {
                 </div>
               ))}
             </div>
-            {/* CTA Banner */}
             <div className="reveal" style={{marginTop:40,borderRadius:22,padding:'clamp(28px,4vw,44px)',background:'linear-gradient(135deg,rgba(139,92,246,0.12),rgba(59,130,246,0.08))',border:'1px solid rgba(139,92,246,0.2)',textAlign:'center'}}>
               <h3 style={{fontSize:'clamp(1.2rem,2.5vw,1.6rem)',fontWeight:800,color:'#f8fafc',marginBottom:12}}>Готов начать?</h3>
               <p style={{color:'#64748b',marginBottom:24,fontSize:'0.9rem'}}>Присоединяйся к ClaudMusic — платформе для настоящих артистов и слушателей.</p>
@@ -1707,7 +1825,7 @@ export function App() {
           </div>
         </section>
 
-        {/* ─── FOOTER ─── */}
+        {/* FOOTER */}
         <footer style={{borderTop:'1px solid rgba(255,255,255,0.06)',padding:'clamp(30px,4vw,50px) 20px 24px'}}>
           <div style={{maxWidth:1280,margin:'0 auto'}}>
             <div style={{display:'flex',flexWrap:'wrap',gap:32,justifyContent:'space-between',marginBottom:28}}>
@@ -1719,7 +1837,7 @@ export function App() {
                   <span style={{fontWeight:800,color:'#f8fafc',fontSize:'0.95rem'}}>ClaudMusic</span>
                 </div>
                 <p style={{fontSize:'0.78rem',color:'#475569',maxWidth:200,lineHeight:1.6}}>Музыкальная платформа для настоящих артистов и слушателей.</p>
-                <div style={{marginTop:10}}><WsStatus connected={wsConnected}/></div>
+                <div style={{marginTop:10}}><OnlineStatus online={online}/></div>
               </div>
               {[
                 {title:'Платформа',links:['Главная','В тренде','Жанры','Новинки']},
@@ -1745,7 +1863,6 @@ export function App() {
             </div>
             <div style={{borderTop:'1px solid rgba(255,255,255,0.06)',paddingTop:18,display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
               <span style={{fontSize:'0.74rem',color:'#334155'}}>© 2026 ClaudMusic. Музыка объединяет.</span>
-              {/* Only Telegram */}
               <a href="https://t.me/cloudmucik" target="_blank" rel="noopener noreferrer"
                 style={{display:'flex',alignItems:'center',gap:7,background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)',borderRadius:10,padding:'6px 12px',textDecoration:'none',transition:'all 0.2s',color:'#475569'}}
                 onMouseEnter={e=>{(e.currentTarget as HTMLElement).style.borderColor='rgba(59,130,246,0.5)';(e.currentTarget as HTMLElement).style.color='#60a5fa';}}
@@ -1758,22 +1875,22 @@ export function App() {
         </footer>
       </main>
 
-      {/* ─── FIXED PLAYER ─── */}
+      {/* FIXED PLAYER */}
       <PlayerBar
         track={playerTrack} isPlaying={isPlaying}
         onPlayPause={()=>setIsPlaying(p=>!p)}
         onNext={handleNext} onPrev={handlePrev}
         onOpenComments={setCommentTrack}
         onDownload={handleDownload}
-        wsRef={wsRef}
+        onlineMode={online}
       />
 
-      {/* ─── MODALS ─── */}
+      {/* MODALS */}
       {(modal==='login'||modal==='register')&&(
-        <AuthModal type={modal} onClose={()=>setModal(null)} onSuccess={handleLogin} onNotify={notify} wsRef={wsRef} serverUsers={serverUsers}/>
+        <AuthModal type={modal} onClose={()=>setModal(null)} onSuccess={handleLogin} onNotify={notify} serverUsers={serverUsers} onlineMode={online}/>
       )}
       {modal==='upload'&&user&&(
-        <UploadModal onClose={()=>setModal(null)} onUpload={handleUpload} onNotify={notify} userName={user.name} userId={user.id}/>
+        <UploadModal onClose={()=>setModal(null)} onUpload={handleUpload} onNotify={notify} userName={user.name} userId={user.id} onlineMode={online}/>
       )}
       {commentTrack&&(
         <CommentsModal
@@ -1781,7 +1898,7 @@ export function App() {
           user={user} onClose={()=>setCommentTrack(null)}
           onUpdateTrack={handleUpdateTrack}
           onRequestLogin={()=>setModal('login')}
-          wsRef={wsRef}
+          onlineMode={online}
         />
       )}
       {resolvedProfileArtist&&(
@@ -1796,7 +1913,7 @@ export function App() {
         />
       )}
 
-      {/* ─── SEARCH RESULTS ─── */}
+      {/* SEARCH */}
       {showSearch&&searchQuery.length>=1&&(
         <SearchResults
           query={searchQuery} tracks={tracks}
@@ -1808,7 +1925,7 @@ export function App() {
         />
       )}
 
-      {/* ─── TOASTS ─── */}
+      {/* TOASTS */}
       <div style={{position:'fixed',top:74,right:16,zIndex:400,display:'flex',flexDirection:'column',gap:8,pointerEvents:'none',maxWidth:'calc(100vw - 32px)'}}>
         {toasts.map(t=><Toast key={t.id} msg={t.msg} onDone={()=>removeToast(t.id)}/>)}
       </div>
